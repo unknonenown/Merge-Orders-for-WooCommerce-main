@@ -1100,6 +1100,14 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 				self::trigger_customer_invoice_email($new_order);
 			}
 
+			do_action(
+				'hostify_merge_orders_after_merge',
+				$new_order->get_id(),
+				array_keys($orders),
+				$new_order,
+				$orders
+			);
+
 			return $new_order->get_id();
 		}
 
@@ -1126,14 +1134,15 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 					}
 
 					if (!$consolidate) {
-						// Copy as-is
-						$target->add_item(self::clone_product_item($item));
+						$new_item = self::clone_product_item($source, $item);
+						$target->add_item($new_item);
 						continue;
 					}
 
 					$key_data = self::line_item_consolidation_key_and_meta($item);
 					$key      = $key_data['key'];
 					$meta     = $key_data['meta'];
+					$trace    = self::get_line_item_source_trace($source, $item);
 
 					if (!isset($line_agg[$key])) {
 						$line_agg[$key] = array(
@@ -1150,6 +1159,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 							'taxes'        => (array) $item->get_taxes(),
 
 							'meta'         => $meta,
+							'source_trace' => $trace,
 						);
 					} else {
 						$line_agg[$key]['quantity'] += (int) $item->get_quantity();
@@ -1160,6 +1170,10 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 						$line_agg[$key]['total_tax']    = self::sum_money($line_agg[$key]['total_tax'], $item->get_total_tax());
 
 						$line_agg[$key]['taxes'] = self::sum_taxes_arrays($line_agg[$key]['taxes'], (array) $item->get_taxes());
+						$line_agg[$key]['source_trace'] = self::merge_source_line_item_traces(
+							$line_agg[$key]['source_trace'] ?? array(),
+							$trace
+						);
 					}
 				}
 
@@ -1217,6 +1231,11 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 						}
 					}
 
+					self::add_source_trace_meta_to_line_item(
+						$new_item,
+						isset($row['source_trace']) && is_array($row['source_trace']) ? $row['source_trace'] : array()
+					);
+
 					$target->add_item($new_item);
 				}
 			}
@@ -1258,7 +1277,10 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 		 * Also returns meta list to re-apply after consolidation.
 		 */
 		private static function line_item_consolidation_key_and_meta(\WC_Order_Item_Product $item): array {
-			$ignore_keys = (array) apply_filters('hostify_merge_orders_line_item_meta_ignore_keys', array(), $item);
+			$ignore_keys = array_merge(
+				self::provenance_meta_keys(),
+				(array) apply_filters('hostify_merge_orders_line_item_meta_ignore_keys', array(), $item)
+			);
 			$ignore_keys = array_map('strval', $ignore_keys);
 
 			$fingerprint_pairs = array();
@@ -1310,7 +1332,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			);
 		}
 
-		private static function clone_product_item(\WC_Order_Item_Product $item): \WC_Order_Item_Product {
+		private static function clone_product_item(\WC_Order $source_order, \WC_Order_Item_Product $item): \WC_Order_Item_Product {
 			$new_item = new \WC_Order_Item_Product();
 			$new_item->set_props(array(
 				'name'         => $item->get_name(),
@@ -1327,12 +1349,105 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			));
 
 			foreach ($item->get_meta_data() as $meta) {
-				if (!empty($meta->key)) {
+				if (!empty($meta->key) && !in_array((string) $meta->key, self::provenance_meta_keys(), true)) {
 					$new_item->add_meta_data($meta->key, $meta->value, false);
 				}
 			}
 
+			self::add_source_trace_meta_to_line_item($new_item, self::get_line_item_source_trace($source_order, $item));
+
 			return $new_item;
+		}
+
+		private static function provenance_meta_keys(): array {
+			return array(
+				'_hostify_source_order_ids',
+				'_hostify_source_order_item_ids',
+				'_hostify_source_line_items',
+			);
+		}
+
+		private static function get_line_item_source_trace(\WC_Order $source_order, \WC_Order_Item_Product $item): array {
+			$trace = self::normalize_source_line_items($item->get_meta('_hostify_source_line_items', true));
+			if (!empty($trace)) {
+				return $trace;
+			}
+
+			$order_id      = (int) $source_order->get_id();
+			$order_item_id = (int) $item->get_id();
+			$quantity      = (float) $item->get_quantity();
+
+			return self::normalize_source_line_items(array(
+				array(
+					'order_id'      => $order_id,
+					'order_item_id' => $order_item_id,
+					'quantity'      => $quantity,
+				),
+			));
+		}
+
+		private static function normalize_source_line_items($value): array {
+			if (!is_array($value)) {
+				return array();
+			}
+
+			$out  = array();
+			$seen = array();
+
+			foreach ($value as $row) {
+				if (!is_array($row)) {
+					continue;
+				}
+
+				$order_id      = isset($row['order_id']) ? (int) $row['order_id'] : 0;
+				$order_item_id = isset($row['order_item_id']) ? (int) $row['order_item_id'] : 0;
+
+				if ($order_id <= 0 || $order_item_id <= 0) {
+					continue;
+				}
+
+				if (!isset($row['quantity']) || !is_numeric($row['quantity'])) {
+					continue;
+				}
+				$quantity = (float) $row['quantity'];
+
+				$pair_key = $order_id . ':' . $order_item_id;
+				if (isset($seen[$pair_key])) {
+					continue;
+				}
+
+				$seen[$pair_key] = true;
+				$out[] = array(
+					'order_id'      => $order_id,
+					'order_item_id' => $order_item_id,
+					'quantity'      => $quantity,
+				);
+			}
+
+			return $out;
+		}
+
+		private static function merge_source_line_item_traces(array $existing, array $incoming): array {
+			return self::normalize_source_line_items(array_merge($existing, $incoming));
+		}
+
+		private static function add_source_trace_meta_to_line_item(\WC_Order_Item_Product $item, array $trace): void {
+			$trace = self::normalize_source_line_items($trace);
+			if (empty($trace)) {
+				return;
+			}
+
+			$order_ids = array();
+			$item_ids  = array();
+
+			foreach ($trace as $row) {
+				$order_ids[] = (int) $row['order_id'];
+				$item_ids[]  = (int) $row['order_item_id'];
+			}
+
+			$item->update_meta_data('_hostify_source_order_ids', array_values(array_unique($order_ids)));
+			$item->update_meta_data('_hostify_source_order_item_ids', array_values(array_unique($item_ids)));
+			$item->update_meta_data('_hostify_source_line_items', $trace);
 		}
 
 		private static function clone_shipping_item(\WC_Order_Item_Shipping $ship_item): \WC_Order_Item_Shipping {
