@@ -1,10 +1,10 @@
-=== Merge Orders for WooCommerce (Sorted & Grouped, 3+) ===
+=== Merge Orders for WooCommerce (Sorted & Grouped, 2+) ===
 Contributors: hostify
 Tags: woocommerce, orders, merge orders, hpos, order management, auctions
 Requires at least: 6.4.3
 Tested up to: 6.9
 Requires PHP: 8.1
-Stable tag: 3.1.0
+Stable tag: 3.2.0
 License: GPL2
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -12,17 +12,17 @@ Merge multiple eligible WooCommerce orders from the same customer into a single 
 
 == Description ==
 
-Merge Orders for WooCommerce (Sorted & Grouped, 3+) helps store owners reduce admin overhead by merging multiple eligible orders from the same customer into one order.
+Merge Orders for WooCommerce (Sorted & Grouped, 2+) helps store owners reduce admin overhead by merging multiple eligible orders from the same customer into one order.
 
 Key features:
 
 * **Grouped admin UI** under *WooCommerce → Merge Orders*, grouped by customer with a dedicated merge form per customer (prevents cross-customer merging).
-* **Default 3+ group visibility**: only customers with **3 or more eligible orders** are shown by default (configurable to 2+ via filter).
+* **Default 2+ group visibility**: only customers with **2 or more eligible orders** are shown by default (configurable via filter).
 * **Date range filter + pagination**: filter by order created date and paginate customer groups for better performance on large stores.
 * **Optional product line consolidation**: identical products/variations (including relevant item meta) can be consolidated into a single line with summed quantity/totals (enabled by default; filterable).
-* **Copies key order items** into the merged order: products (with item meta), shipping lines, fees, and coupons.
+* **Copies key order items** into the merged order: products (with item meta), fees, coupons, and one shipping charge by default to avoid duplicate fixed delivery fees.
 * **Safe validations**: selected orders must belong to the same customer and use the same currency.
-* **Card-payment safeguard**: merging is blocked for orders paid via card gateways (Stripe/WCPay/etc.). The list is filterable.
+* **Card-payment safeguard**: card-paid/card-gateway orders are hidden from the candidate list and blocked server-side. Exact methods, prefixes, and title keywords are filterable.
 * **Stock safety**: prevents stock mismatches when merging orders that already reduced stock; reduces stock only once on the final merged order when appropriate.
 * **Email behavior**: for merged orders that end in **Pending** status, the plugin triggers the **Customer Invoice** email to provide a payment link.
 * **YITH WooCommerce Auctions support**: when an auction is won, the related order can be placed on-hold (if the integration is active).
@@ -51,7 +51,7 @@ WooCommerce 8.0+ is required.
 No. The plugin enforces same-customer merging (user ID or guest email) and validates this on the server.
 
 = Can I merge only two orders? (2+) =
-Yes. The merge logic supports 2 orders; the admin list default is 3+ for noise reduction. To show 2+ groups, add:
+Yes. The merge logic supports 2 orders; the admin list default is already 2+. To change the minimum group size, add:
 
     add_filter('hostify_merge_orders_min_group_size', function () {
         return 2;
@@ -79,11 +79,18 @@ Yes, using either filter:
 
 == Screenshots ==
 
-1. Merge Orders admin page with date range filters and customer-group pagination.
+1. Merge Orders admin page with date range filters, customer-group pagination, and card-order exclusion notice.
 2. Customer group table (includes Customer Name column) and the merge action button.
 3. Merge confirmation page showing the created order.
 
 == Changelog ==
+
+= 3.2.0 =
+* Excluded card-paid/card-gateway orders from the merge candidate list and kept server-side blocking.
+* Added broader, filterable card-payment detection by method ID, method prefix, payment title keywords, and card payment tokens.
+* Changed shipping merge behavior to keep a single shipping charge by default, preventing duplicate fixed delivery fees.
+* Added an order note when additional shipping lines are omitted by the merge policy.
+* Updated documentation to match the 2+ default group visibility.
 
 = 3.1.0 =
 * Added date range filtering and customer-group pagination in the admin UI.
@@ -106,6 +113,9 @@ Yes, using either filter:
 * Initial release.
 
 == Upgrade Notice ==
+
+= 3.2.0 =
+Excludes card-paid/card-gateway orders from merge candidates and keeps only one shipping charge by default.
 
 = 3.1.0 =
 Adds date filtering, pagination, and optional line-item consolidation, plus improved stock safety.

@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Merge Orders for WooCommerce (Sorted & Grouped, 2+)
- * Description: Merges multiple eligible orders from the same customer into one. Shows only customers with 3+ eligible orders. Includes date filter + pagination and optional line-item consolidation.
- * Version:     3.1.0
+ * Description: Merges multiple eligible WooCommerce orders from the same customer into one. Excludes card-paid/card-gateway orders and keeps only one shipping charge by default. Includes date filter, pagination and optional line-item consolidation.
+ * Version:     3.2.0
  * Author:      Hostify
  * Text Domain: merge-orders-for-woocommerce-sorted-grouped
  * Domain Path: /languages
@@ -16,7 +16,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 
 	final class Hostify_Merge_Orders_For_WooCommerce {
 
-		public const VERSION      = '3.1.0';
+		public const VERSION      = '3.2.0';
 		public const TEXT_DOMAIN  = 'merge-orders-for-woocommerce-sorted-grouped';
 		public const MIN_WC_VER   = '8.0';
 
@@ -164,7 +164,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 
 		/**
 		 * Minimum eligible orders per customer group to show on admin page.
-		 * Default 3 (as plugin name/description).
+		 * Default 2 (merge makes sense only for 2+ orders).
 		 *
 		 * add_filter('hostify_merge_orders_min_group_size', fn() => 4);
 		 */
@@ -353,6 +353,11 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 					continue;
 				}
 
+				// Card-paid/card-gateway orders must not enter the merge candidate list.
+				if (!self::is_order_merge_candidate($order)) {
+					continue;
+				}
+
 				$key = self::customer_group_key($order);
 
 				if (!isset($grouped[$key])) {
@@ -482,7 +487,9 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			echo '<div class="notice notice-warning" style="padding:10px 12px;margin-top:12px;">';
 			echo '<p><strong>' . esc_html__('Important:', self::TEXT_DOMAIN) . '</strong> ';
 			echo esc_html__('If you include Processing orders in a merge, review your stock/payment workflow carefully.', self::TEXT_DOMAIN);
-			echo '</p></div>';
+			echo '</p>';
+			echo '<p>' . esc_html__('Orders paid by card/card gateways are hidden from this list and are blocked server-side.', self::TEXT_DOMAIN) . '</p>';
+			echo '</div>';
 
 			// Filter form (date range + groups per page)
 			echo '<form method="get" style="margin:16px 0 8px;padding:12px;background:#fff;border:1px solid #ccd0d4;border-radius:4px;">';
@@ -1114,13 +1121,17 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 		/**
 		 * Copy items from multiple orders into target:
 		 * - line items: consolidated if enabled
-		 * - shipping/fees/coupons: copied as-is per source
+		 * - shipping: one charge by default (prevents duplicate fixed delivery fees)
+		 * - fees/coupons: copied as-is per source
 		 */
 		private static function copy_all_items_from_orders(array $source_orders, \WC_Order $target): void {
 			$consolidate = self::consolidate_line_items_enabled();
 
-			// Accumulator for consolidated line items
+			// Accumulator for consolidated line items.
 			$line_agg = array();
+
+			// Shipping lines are collected first so duplicate fixed delivery fees can be collapsed to one charge.
+			$shipping_items = array();
 
 			foreach ($source_orders as $source) {
 				if (!$source instanceof \WC_Order) {
@@ -1177,10 +1188,10 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 					}
 				}
 
-				// Shipping
+				// Shipping (added after the loop according to the configured shipping merge policy).
 				foreach ($source->get_items('shipping') as $ship_item) {
 					if ($ship_item instanceof \WC_Order_Item_Shipping) {
-						$target->add_item(self::clone_shipping_item($ship_item));
+						$shipping_items[] = self::clone_shipping_item($ship_item);
 					}
 				}
 
@@ -1198,6 +1209,9 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 					}
 				}
 			}
+
+			// Add shipping after all source orders are inspected. By default, this keeps only one fixed delivery charge.
+			self::add_shipping_items_to_target($target, $shipping_items);
 
 			// Add consolidated line items last (order of items is not critical)
 			if ($consolidate && !empty($line_agg)) {
@@ -1450,6 +1464,76 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			$item->update_meta_data('_hostify_source_line_items', $trace);
 		}
 
+		private static function single_shipping_charge_enabled(): bool {
+			return (bool) apply_filters('hostify_merge_orders_single_shipping_charge', true);
+		}
+
+		private static function add_shipping_items_to_target(\WC_Order $target, array $shipping_items): void {
+			$shipping_items = array_values(array_filter($shipping_items, function($item) {
+				return $item instanceof \WC_Order_Item_Shipping;
+			}));
+
+			if (empty($shipping_items)) {
+				return;
+			}
+
+			if (!self::single_shipping_charge_enabled()) {
+				foreach ($shipping_items as $ship_item) {
+					$target->add_item($ship_item);
+				}
+				return;
+			}
+
+			$selected = self::select_shipping_item_to_keep($shipping_items);
+			if ($selected instanceof \WC_Order_Item_Shipping) {
+				$target->add_item($selected);
+			}
+
+			$omitted = count($shipping_items) - 1;
+			if ($omitted > 0) {
+				$target->add_order_note(
+					sprintf(
+						/* translators: %d number of omitted shipping lines */
+						__('Multiple source orders had shipping charges. Merge policy kept one shipping charge and omitted %d additional shipping line(s).', self::TEXT_DOMAIN),
+						$omitted
+					),
+					false
+				);
+			}
+		}
+
+		private static function select_shipping_item_to_keep(array $shipping_items): ?\WC_Order_Item_Shipping {
+			$best = null;
+			$best_score = null;
+
+			foreach ($shipping_items as $ship_item) {
+				if (!$ship_item instanceof \WC_Order_Item_Shipping) {
+					continue;
+				}
+
+				$score = self::shipping_item_score($ship_item);
+				if (!$best instanceof \WC_Order_Item_Shipping || $score > (float) $best_score) {
+					$best = $ship_item;
+					$best_score = $score;
+				}
+			}
+
+			return $best;
+		}
+
+		private static function shipping_item_score(\WC_Order_Item_Shipping $ship_item): float {
+			$score = (float) $ship_item->get_total();
+			$taxes = (array) $ship_item->get_taxes();
+
+			if (isset($taxes['total']) && is_array($taxes['total'])) {
+				foreach ($taxes['total'] as $amount) {
+					$score += (float) $amount;
+				}
+			}
+
+			return $score;
+		}
+
 		private static function clone_shipping_item(\WC_Order_Item_Shipping $ship_item): \WC_Order_Item_Shipping {
 			$new_ship = new \WC_Order_Item_Shipping();
 			$new_ship->set_method_title($ship_item->get_method_title());
@@ -1553,9 +1637,28 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			}
 		}
 
+		private static function is_order_merge_candidate(\WC_Order $order): bool {
+			$is_candidate = !self::is_card_payment($order);
+
+			return (bool) apply_filters('hostify_merge_orders_is_order_candidate', $is_candidate, $order);
+		}
+
+		private static function normalize_gateway_text(string $value): string {
+			$value = trim($value);
+			if ($value === '') {
+				return '';
+			}
+
+			return function_exists('mb_strtolower') ? mb_strtolower($value, 'UTF-8') : strtolower($value);
+		}
+
 		private static function is_card_payment(\WC_Order $order): bool {
-			$method = (string) $order->get_payment_method();
-			if ($method === '') {
+			$method_raw = (string) $order->get_payment_method();
+			$method     = sanitize_key($method_raw);
+			$title      = self::normalize_gateway_text((string) $order->get_payment_method_title());
+			$method_lc  = self::normalize_gateway_text($method_raw);
+
+			if ($method === '' && $title === '') {
 				return false;
 			}
 
@@ -1563,20 +1666,92 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 				'stripe',
 				'stripe_cc',
 				'woocommerce_payments',
+				'woocommerce_payments_card',
 				'wc_payments',
 				'braintree',
 				'authorizenet',
 				'paypal_pro',
 				'nestpay',
+				'monri',
+				'wspay',
+				'corvuspay',
+				'payten',
+				'bankart',
+				'chipcard',
 			);
 
-			// Backward compat
+			// Backward compat.
 			$card_methods = (array) apply_filters('merge_orders_card_payment_methods', $default);
 			$card_methods = (array) apply_filters('hostify_merge_orders_card_payment_methods', $card_methods, $order);
+			$card_methods = array_values(array_unique(array_filter(array_map('sanitize_key', $card_methods))));
 
-			$card_methods = array_map('sanitize_key', $card_methods);
+			if ($method !== '' && in_array($method, $card_methods, true)) {
+				return true;
+			}
 
-			return in_array($method, $card_methods, true);
+			$default_prefixes = array(
+				'stripe',
+				'wc_payments',
+				'woocommerce_payments',
+				'braintree',
+				'authorizenet',
+				'nestpay',
+				'monri',
+				'wspay',
+				'corvuspay',
+				'payten',
+				'bankart',
+				'chipcard',
+			);
+			$prefixes = (array) apply_filters('hostify_merge_orders_card_payment_method_prefixes', $default_prefixes, $order);
+			$prefixes = array_values(array_unique(array_filter(array_map('sanitize_key', $prefixes))));
+
+			foreach ($prefixes as $prefix) {
+				if ($prefix !== '' && $method !== '' && strpos($method, $prefix) === 0) {
+					return true;
+				}
+			}
+
+			$default_keywords = array(
+				'card',
+				'credit card',
+				'debit card',
+				'kartic',
+				'kartica',
+				'kreditna',
+				'debitna',
+				'visa',
+				'mastercard',
+				'maestro',
+				'amex',
+			);
+			$keywords = (array) apply_filters('hostify_merge_orders_card_payment_keywords', $default_keywords, $order);
+			$haystack = trim($method_lc . ' ' . $title);
+
+			foreach ($keywords as $keyword) {
+				$keyword = self::normalize_gateway_text((string) $keyword);
+				if ($keyword !== '' && $haystack !== '' && strpos($haystack, $keyword) !== false) {
+					return true;
+				}
+			}
+
+			if (method_exists($order, 'get_payment_tokens')) {
+				foreach ((array) $order->get_payment_tokens() as $token) {
+					if ((is_int($token) || ctype_digit((string) $token)) && class_exists('WC_Payment_Tokens')) {
+						$token = \WC_Payment_Tokens::get((int) $token);
+					}
+
+					if ($token instanceof \WC_Payment_Token_CC) {
+						return true;
+					}
+
+					if (is_object($token) && method_exists($token, 'get_type') && 'CC' === (string) $token->get_type()) {
+						return true;
+					}
+				}
+			}
+
+			return false;
 		}
 
 		private static function trigger_customer_invoice_email(\WC_Order $order): void {

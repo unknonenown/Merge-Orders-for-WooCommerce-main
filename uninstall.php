@@ -1,6 +1,6 @@
 <?php
 /**
- * Uninstall routine for Merge Orders for WooCommerce (Sorted & Grouped, 3+)
+ * Uninstall routine for Merge Orders for WooCommerce (Sorted & Grouped, 2+)
  *
  * Notes:
  * - Reverts orders that this plugin marked as "Merged" back to "Pending".
