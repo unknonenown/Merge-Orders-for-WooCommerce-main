@@ -1017,6 +1017,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 
 			// Copy all items; with consolidation for line items
 			self::copy_all_items_from_orders($orders, $new_order);
+			self::maybe_apply_free_shipping_for_merged_order($new_order);
 
 			// Order-level meta copy: default from first only (safer).
 			$copy_meta_all = (bool) apply_filters('hostify_merge_orders_copy_meta_from_all_orders', false);
@@ -1582,6 +1583,182 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			}
 
 			return $new_coupon;
+		}
+
+		private static function maybe_apply_free_shipping_for_merged_order(\WC_Order $order): void {
+			$enabled = (bool) apply_filters('hostify_merge_orders_apply_free_shipping_threshold', true, $order);
+			if (!$enabled) {
+				return;
+			}
+
+			$method = self::get_matching_free_shipping_method_for_order($order);
+			if (!$method) {
+				return;
+			}
+
+			if (!self::order_meets_free_shipping_method_requirements($order, $method)) {
+				return;
+			}
+
+			self::replace_order_shipping_with_free_shipping($order, $method);
+		}
+
+		private static function get_matching_free_shipping_method_for_order(\WC_Order $order) {
+			if (!class_exists('\WC_Shipping_Zones') || !method_exists('\WC_Shipping_Zones', 'get_zone_matching_package')) {
+				return null;
+			}
+
+			$package = self::build_shipping_package_from_order($order);
+			if (empty($package['destination']) || !is_array($package['destination'])) {
+				return null;
+			}
+
+			$zone = \WC_Shipping_Zones::get_zone_matching_package($package);
+			if (!is_object($zone) || !method_exists($zone, 'get_shipping_methods')) {
+				return null;
+			}
+
+			$methods = $zone->get_shipping_methods(true);
+			if (!is_array($methods)) {
+				return null;
+			}
+
+			foreach ($methods as $method) {
+				if (!is_object($method)) {
+					continue;
+				}
+				$method_id = isset($method->id) ? (string) $method->id : '';
+				if ('free_shipping' === $method_id) {
+					return $method;
+				}
+			}
+
+			return null;
+		}
+
+		private static function build_shipping_package_from_order(\WC_Order $order): array {
+			$destination = array(
+				'country'   => (string) ($order->get_shipping_country() ?: $order->get_billing_country()),
+				'state'     => (string) ($order->get_shipping_state() ?: $order->get_billing_state()),
+				'postcode'  => (string) ($order->get_shipping_postcode() ?: $order->get_billing_postcode()),
+				'city'      => (string) ($order->get_shipping_city() ?: $order->get_billing_city()),
+				'address'   => (string) ($order->get_shipping_address_1() ?: $order->get_billing_address_1()),
+				'address_2' => (string) ($order->get_shipping_address_2() ?: $order->get_billing_address_2()),
+			);
+
+			return array(
+				'destination' => $destination,
+				'contents'    => array(),
+			);
+		}
+
+		private static function order_meets_free_shipping_method_requirements(\WC_Order $order, $method): bool {
+			if (!is_object($method)) {
+				return false;
+			}
+
+			$settings = array();
+			if (isset($method->instance_settings) && is_array($method->instance_settings)) {
+				$settings = $method->instance_settings;
+			} elseif (isset($method->settings) && is_array($method->settings)) {
+				$settings = $method->settings;
+			}
+
+			$requires = isset($settings['requires']) ? (string) $settings['requires'] : '';
+			$requires = trim($requires);
+
+			$ignore_discounts = isset($settings['ignore_discounts']) ? (string) $settings['ignore_discounts'] : 'no';
+			$min_amount = isset($settings['min_amount']) ? (float) $settings['min_amount'] : 0.0;
+
+			$order_amount = self::get_order_amount_for_free_shipping_threshold($order, 'yes' === $ignore_discounts);
+			$meets_min    = $order_amount >= $min_amount;
+			$has_coupon   = self::order_has_free_shipping_coupon($order);
+
+			if ('' === $requires) {
+				return true;
+			}
+			if ('min_amount' === $requires) {
+				return $meets_min;
+			}
+			if ('coupon' === $requires) {
+				return $has_coupon;
+			}
+			if ('both' === $requires) {
+				return $meets_min && $has_coupon;
+			}
+			if ('either' === $requires) {
+				return $meets_min || $has_coupon;
+			}
+
+			return false;
+		}
+
+		private static function get_order_amount_for_free_shipping_threshold(\WC_Order $order, bool $ignore_discounts): float {
+			$amount = 0.0;
+			foreach ($order->get_items('line_item') as $item) {
+				if (!$item instanceof \WC_Order_Item_Product) {
+					continue;
+				}
+				$amount += $ignore_discounts ? (float) $item->get_subtotal() : (float) $item->get_total();
+			}
+			return $amount;
+		}
+
+		private static function order_has_free_shipping_coupon(\WC_Order $order): bool {
+			if (!class_exists('\WC_Coupon')) {
+				return false;
+			}
+
+			foreach ($order->get_items('coupon') as $coupon_item) {
+				if (!$coupon_item instanceof \WC_Order_Item_Coupon) {
+					continue;
+				}
+				$code = trim((string) $coupon_item->get_code());
+				if ('' === $code) {
+					continue;
+				}
+
+				try {
+					$coupon = new \WC_Coupon($code);
+				} catch (\Throwable $e) {
+					$coupon = null;
+				}
+
+				if (!$coupon instanceof \WC_Coupon) {
+					continue;
+				}
+
+				if ((bool) $coupon->get_free_shipping()) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		private static function replace_order_shipping_with_free_shipping(\WC_Order $order, $method): void {
+			$order->remove_order_items('shipping');
+
+			$item = new \WC_Order_Item_Shipping();
+			$item->set_method_id('free_shipping');
+			if (isset($method->instance_id)) {
+				$item->set_instance_id((int) $method->instance_id);
+			}
+			$title = '';
+			if (method_exists($method, 'get_title')) {
+				$title = (string) $method->get_title();
+			}
+			if ('' === $title && isset($method->title)) {
+				$title = (string) $method->title;
+			}
+			$item->set_method_title($title !== '' ? $title : __('Free shipping', self::TEXT_DOMAIN));
+			$item->set_total(0);
+			$item->set_taxes(array('total' => array()));
+
+			$order->add_item($item);
+			$order->add_order_note(
+				__('Free Shipping was applied on the merged order because the configured Free Shipping condition was met.', self::TEXT_DOMAIN),
+				false
+			);
 		}
 
 		private static function copy_order_level_meta(\WC_Order $source, \WC_Order $target, bool $is_first_source): void {
