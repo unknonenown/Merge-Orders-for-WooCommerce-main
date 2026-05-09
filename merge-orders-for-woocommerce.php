@@ -1018,6 +1018,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			// Copy all items; with consolidation for line items
 			self::copy_all_items_from_orders($orders, $new_order);
 			self::maybe_apply_free_shipping_for_merged_order($new_order);
+			self::sync_shipping_articles_meta($new_order);
 
 			// Order-level meta copy: default from first only (safer).
 			$copy_meta_all = (bool) apply_filters('hostify_merge_orders_copy_meta_from_all_orders', false);
@@ -1535,6 +1536,88 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			return $score;
 		}
 
+
+		private static function shipping_articles_meta_keys(): array {
+			$keys = (array) apply_filters('hostify_merge_orders_shipping_articles_meta_keys', array('Artikli'));
+			$out = array();
+
+			foreach ($keys as $key) {
+				$key = trim((string) $key);
+				if ($key !== '') {
+					$out[] = $key;
+				}
+			}
+
+			return array_values(array_unique($out));
+		}
+
+		private static function shipping_item_meta_ignore_keys(): array {
+			$keys = (array) apply_filters('hostify_merge_orders_shipping_item_meta_ignore_keys', array('Artikli'));
+			$out = array();
+
+			foreach ($keys as $key) {
+				$key = trim((string) $key);
+				if ($key !== '') {
+					$out[] = $key;
+				}
+			}
+
+			return array_values(array_unique($out));
+		}
+
+		private static function build_shipping_articles_meta_value(\WC_Order $order): string {
+			$parts = array();
+
+			foreach ($order->get_items('line_item') as $item) {
+				if (!$item instanceof \WC_Order_Item_Product) {
+					continue;
+				}
+
+				$name = trim((string) $item->get_name());
+				if ($name === '') {
+					continue;
+				}
+
+				$quantity = $item->get_quantity();
+				$quantity_str = (string) $quantity;
+				if (is_numeric($quantity)) {
+					$quantity_num = (float) $quantity;
+					if ((float) (int) $quantity_num === $quantity_num) {
+						$quantity_str = (string) (int) $quantity_num;
+					} else {
+						$quantity_str = rtrim(rtrim(sprintf('%.10F', $quantity_num), '0'), '.');
+					}
+				}
+
+				$parts[] = $name . ' × ' . $quantity_str;
+			}
+
+			return implode(', ', $parts);
+		}
+
+		private static function sync_shipping_articles_meta(\WC_Order $order): void {
+			$meta_keys = self::shipping_articles_meta_keys();
+			if (empty($meta_keys)) {
+				return;
+			}
+
+			$article_value = self::build_shipping_articles_meta_value($order);
+			$shipping_items = $order->get_items('shipping');
+
+			foreach ($shipping_items as $shipping_item) {
+				if (!$shipping_item instanceof \WC_Order_Item_Shipping) {
+					continue;
+				}
+
+				foreach ($meta_keys as $meta_key) {
+					$shipping_item->delete_meta_data($meta_key);
+					if ($article_value !== '') {
+						$shipping_item->add_meta_data($meta_key, $article_value, true);
+					}
+				}
+			}
+		}
+
 		private static function clone_shipping_item(\WC_Order_Item_Shipping $ship_item): \WC_Order_Item_Shipping {
 			$new_ship = new \WC_Order_Item_Shipping();
 			$new_ship->set_method_title($ship_item->get_method_title());
@@ -1542,10 +1625,19 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 			$new_ship->set_total($ship_item->get_total());
 			$new_ship->set_taxes($ship_item->get_taxes());
 
+			$ignore_keys = self::shipping_item_meta_ignore_keys();
+
 			foreach ($ship_item->get_meta_data() as $meta) {
-				if (!empty($meta->key)) {
-					$new_ship->add_meta_data($meta->key, $meta->value, false);
+				if (empty($meta->key)) {
+					continue;
 				}
+
+				$meta_key = (string) $meta->key;
+				if (in_array($meta_key, $ignore_keys, true)) {
+					continue;
+				}
+
+				$new_ship->add_meta_data($meta_key, $meta->value, false);
 			}
 
 			return $new_ship;
