@@ -3,7 +3,7 @@
  * Plugin Name: Merge Orders for WooCommerce (Sorted & Grouped, 2+)
  * Description: Merges multiple eligible WooCommerce orders from the same customer into one. Excludes card-paid/card-gateway orders and keeps only one shipping charge by default. Includes date filter, pagination and optional line-item consolidation.
  * Version:     3.2.1
- * Author:      Hostify
+ * Author:      Delovionline
  * Text Domain: merge-orders-for-woocommerce-sorted-grouped
  * Domain Path: /languages
  * Requires PHP: 8.1
@@ -654,8 +654,8 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 
 			echo '<p style="margin-top:24px;color:#666;">';
 			echo wp_kses_post(sprintf(
-				__('Powered by <a href="%s" target="_blank" rel="noopener">Hostify</a>.', self::TEXT_DOMAIN),
-				'https://hostify.co.za'
+				__('Powered by <a href="%s" target="_blank" rel="noopener">Delovionline</a>.', self::TEXT_DOMAIN),
+				'https://delovionline.rs'
 			));
 			echo '</p>';
 
