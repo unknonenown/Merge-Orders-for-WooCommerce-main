@@ -16,7 +16,7 @@ if (!class_exists('Hostify_Merge_Orders_For_WooCommerce')) {
 
 	final class Hostify_Merge_Orders_For_WooCommerce {
 
-		public const VERSION      = '3.2.0';
+		public const VERSION      = '3.2.1';
 		public const TEXT_DOMAIN  = 'merge-orders-for-woocommerce-sorted-grouped';
 		public const MIN_WC_VER   = '8.0';
 
